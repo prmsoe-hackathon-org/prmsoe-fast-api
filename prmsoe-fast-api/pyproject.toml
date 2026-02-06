@@ -8,7 +8,9 @@ dependencies = [
     "modal",
     "fastapi",
     "supabase",
-    "google-generativeai",
+    "google-genai",
     "httpx",
     "python-multipart",
+    "python-dotenv",
+    "uvicorn",
 ]
