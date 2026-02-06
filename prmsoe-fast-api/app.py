@@ -562,6 +562,92 @@ async def analytics_dashboard(user_id: str = Query(...)):
 
 
 # ---------------------------------------------------------------------------
+# Section 7b: AGI (agi.tech) endpoints for LinkedIn CSV export automation
+# ---------------------------------------------------------------------------
+
+AGI_BASE = "https://api.agi.tech/v1"
+
+
+def _agi_headers() -> dict[str, str]:
+    api_key = os.environ.get("AGI_API_KEY", "")
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+
+@web_app.post("/agi/session")
+async def agi_create_session():
+    """Create an AGI computer-use session and return session_id + vnc_url."""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{AGI_BASE}/sessions",
+                headers=_agi_headers(),
+                json={"agent_name": "agi-0"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        return {
+            "session_id": data["session_id"],
+            "vnc_url": data["vnc_url"],
+        }
+    except httpx.HTTPStatusError as e:
+        logger.error(f"AGI session creation failed: {e.response.status_code} {e.response.text}")
+        raise HTTPException(status_code=502, detail="Failed to create AGI session")
+    except Exception as e:
+        logger.error(f"AGI session creation error: {e}")
+        raise HTTPException(status_code=502, detail="Failed to create AGI session")
+
+
+@web_app.post("/agi/session/{session_id}/export-connections")
+async def agi_export_connections(session_id: str):
+    """Send the LinkedIn data-export navigation task to an AGI session."""
+    task_message = (
+        "Navigate to LinkedIn Settings. Click on 'Data privacy' in the left sidebar. "
+        "Then click 'Get a copy of your data'. Select only 'Connections' and deselect "
+        "everything else. Then click 'Request archive'. Wait for the confirmation message "
+        "that the request has been submitted."
+    )
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{AGI_BASE}/sessions/{session_id}/message",
+                headers=_agi_headers(),
+                json={"content": task_message},
+            )
+            resp.raise_for_status()
+        return {"ok": True}
+    except httpx.HTTPStatusError as e:
+        logger.error(f"AGI export task failed: {e.response.status_code} {e.response.text}")
+        raise HTTPException(status_code=502, detail="Failed to send export task to AGI")
+    except Exception as e:
+        logger.error(f"AGI export task error: {e}")
+        raise HTTPException(status_code=502, detail="Failed to send export task to AGI")
+
+
+@web_app.get("/agi/session/{session_id}/messages")
+async def agi_get_messages(session_id: str, after_id: int = Query(default=0)):
+    """Poll AGI session messages (proxied to avoid exposing API key to frontend)."""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(
+                f"{AGI_BASE}/sessions/{session_id}/messages",
+                headers=_agi_headers(),
+                params={"after_id": after_id},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        return {"messages": data.get("messages", [])}
+    except httpx.HTTPStatusError as e:
+        logger.error(f"AGI messages poll failed: {e.response.status_code} {e.response.text}")
+        raise HTTPException(status_code=502, detail="Failed to fetch AGI messages")
+    except Exception as e:
+        logger.error(f"AGI messages poll error: {e}")
+        raise HTTPException(status_code=502, detail="Failed to fetch AGI messages")
+
+
+# ---------------------------------------------------------------------------
 # Section 8: enrich_batch (background Modal function)
 # ---------------------------------------------------------------------------
 
