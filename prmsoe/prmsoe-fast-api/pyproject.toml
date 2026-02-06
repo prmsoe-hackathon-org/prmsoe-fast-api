@@ -1,0 +1,16 @@
+[project]
+name = "prmsoe-fast-api"
+version = "0.1.0"
+description = "Modal + FastAPI backend for AI-driven LinkedIn outreach tool"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "modal",
+    "fastapi",
+    "supabase",
+    "google-genai",
+    "httpx",
+    "python-multipart",
+    "python-dotenv",
+    "uvicorn",
+]
