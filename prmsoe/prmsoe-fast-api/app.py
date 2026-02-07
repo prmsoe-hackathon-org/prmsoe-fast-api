@@ -16,6 +16,7 @@ import httpx
 import modal
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 # Load .env in local dev mode (set by __main__ or manually)
@@ -640,16 +641,22 @@ async def analytics_dashboard(user_id: str = Query(...)):
 @web_app.post("/composio/connect")
 async def composio_connect(req: ComposioConnectRequest):
     """Initiate Gmail OAuth via Composio. Returns redirect_url for user to approve."""
-    composio = get_composio()
-    gmail_auth_config_id = get_gmail_auth_config_id()
+    try:
+        composio = get_composio()
+        gmail_auth_config_id = get_gmail_auth_config_id()
 
-    connection_request = composio.connected_accounts.initiate(
-        user_id=req.user_id,
-        auth_config_id=gmail_auth_config_id,
-        callback_url=req.callback_url,
-    )
+        connection_request = composio.connected_accounts.initiate(
+            user_id=req.user_id,
+            auth_config_id=gmail_auth_config_id,
+            callback_url=req.callback_url,
+        )
 
-    return {"redirect_url": connection_request.redirect_url}
+        return {"redirect_url": connection_request.redirect_url}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"/composio/connect error: {e}")
+        return JSONResponse(status_code=500, content={"detail": str(e)})
 
 
 @web_app.get("/composio/status")
@@ -669,99 +676,179 @@ async def composio_status(user_id: str = Query(...)):
     return {"connected": False}
 
 
+@web_app.post("/composio/disconnect")
+async def composio_disconnect(req: AutoDetectRequest):
+    """Disconnect (unlink) user's Gmail integration via Composio."""
+    try:
+        composio = get_composio()
+
+        connected_accounts = composio.connected_accounts.list(
+            user_ids=[req.user_id],
+            toolkit_slugs=["gmail"],
+        )
+
+        for account in connected_accounts.items:
+            if account.status == "ACTIVE":
+                composio.connected_accounts.delete(account.id)
+
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"/composio/disconnect error: {e}")
+        return JSONResponse(status_code=500, content={"detail": str(e)})
+
+
+DEMO_USER_ID = "c877835e-4609-4075-9892-84bf9c3e8f97"
+
+
 @web_app.post("/feedback/auto-detect")
 async def feedback_auto_detect(req: AutoDetectRequest):
     """Scan Gmail for LinkedIn reply notifications and auto-mark matching outreach as REPLIED."""
-    sb = get_supabase()
-    composio = get_composio()
+    try:
+        sb = get_supabase()
 
-    # 1. Get user's contacts with PENDING outreach attempts (same pattern as /feedback/queue)
-    contacts = sb.table("contacts").select("id, full_name, company_name").eq("user_id", req.user_id).execute()
-    if not contacts.data:
-        return {"detected": [], "count": 0}
+        # Mock scan for demo user — match contacts against fake LinkedIn emails
+        if req.user_id == DEMO_USER_ID:
+            mock_emails = [
+                {
+                    "from": "messaging-digest-noreply@linkedin.com",
+                    "subject": "1 new message awaits your response",
+                    "body": "Bedir Aygun Software Engineer sent you a new message. View message",
+                },
+            ]
 
-    contact_ids = [c["id"] for c in contacts.data]
-    contact_map = {c["id"]: c for c in contacts.data}
+            contacts = sb.table("contacts").select("id, full_name, company_name").eq("user_id", req.user_id).execute()
+            if not contacts.data:
+                return {"detected": [], "count": 0}
+            contact_map = {c["id"]: c for c in contacts.data}
 
-    # Get PENDING outreach attempts (no date filter — scan all pending)
-    attempts = (
-        sb.table("outreach_attempts")
-        .select("*")
-        .in_("contact_id", contact_ids)
-        .eq("feedback_status", FeedbackStatus.PENDING.value)
-        .execute()
-    )
-
-    if not attempts.data:
-        return {"detected": [], "count": 0}
-
-    # 2. Build lookup: full_name.lower() → [outreach attempt rows]
-    name_to_attempts: dict[str, list[dict]] = {}
-    for a in attempts.data:
-        c = contact_map.get(a["contact_id"], {})
-        name = c.get("full_name", "").lower().strip()
-        if name:
-            name_to_attempts.setdefault(name, []).append(a)
-
-    # 3. Get active Gmail connected account
-    connected_accounts = composio.connected_accounts.list(
-        user_ids=[req.user_id],
-        toolkit_slugs=["gmail"],
-    )
-
-    connected_account_id = None
-    for account in connected_accounts.items:
-        if account.status == "ACTIVE":
-            connected_account_id = account.id
-            break
-
-    if not connected_account_id:
-        raise HTTPException(status_code=400, detail="Gmail not connected. Connect via /composio/connect first.")
-
-    # 4. Fetch LinkedIn notification emails via Composio
-    result = composio.tools.execute(
-        "GMAIL_FETCH_EMAILS",
-        user_id=req.user_id,
-        connected_account_id=connected_account_id,
-        arguments={
-            "query": "from:linkedin.com newer_than:3d",
-            "max_results": 50,
-        },
-    )
-
-    response_data = result.get("data", {}) if isinstance(result, dict) else {}
-    emails = response_data.get("emails", response_data.get("messages", []))
-    if isinstance(emails, dict):
-        emails = [emails]
-
-    # 5. Match emails to pending contacts
-    detected = []
-    matched_attempt_ids = set()
-
-    for email in emails:
-        subject = (email.get("subject") or "").lower()
-        body = (email.get("body") or email.get("snippet") or "").lower()
-        text = subject + " " + body
-
-        for name, attempt_list in name_to_attempts.items():
-            if name in text:
-                for a in attempt_list:
-                    if a["id"] not in matched_attempt_ids:
-                        matched_attempt_ids.add(a["id"])
-                        c = contact_map.get(a["contact_id"], {})
+            # Match mock emails against contacts by name
+            matched_contact_ids: set[str] = set()
+            detected = []
+            for email in mock_emails:
+                text = (email["subject"] + " " + email["body"]).lower()
+                for c in contacts.data:
+                    name = c.get("full_name", "").lower().strip()
+                    if name and name in text and c["id"] not in matched_contact_ids:
+                        matched_contact_ids.add(c["id"])
                         detected.append({
                             "full_name": c.get("full_name", ""),
                             "company_name": c.get("company_name", ""),
                         })
 
-    # 6. Update matched outreach attempts → REPLIED + COMPLETED
-    for attempt_id in matched_attempt_ids:
-        sb.table("outreach_attempts").update({
-            "outcome": OutcomeType.REPLIED.value,
-            "feedback_status": FeedbackStatus.COMPLETED.value,
-        }).eq("id", attempt_id).execute()
+            # Mark matching outreach attempts as REPLIED so cards disappear from queue
+            if matched_contact_ids:
+                attempts = (
+                    sb.table("outreach_attempts")
+                    .select("id")
+                    .in_("contact_id", list(matched_contact_ids))
+                    .eq("feedback_status", FeedbackStatus.PENDING.value)
+                    .execute()
+                )
+                for a in (attempts.data or []):
+                    sb.table("outreach_attempts").update({
+                        "outcome": OutcomeType.REPLIED.value,
+                        "feedback_status": FeedbackStatus.COMPLETED.value,
+                    }).eq("id", a["id"]).execute()
 
-    return {"detected": detected, "count": len(detected)}
+            return {"detected": detected, "count": len(detected)}
+
+        composio = get_composio()
+
+        # 1. Get user's contacts with PENDING outreach attempts (same pattern as /feedback/queue)
+        contacts = sb.table("contacts").select("id, full_name, company_name").eq("user_id", req.user_id).execute()
+        if not contacts.data:
+            return {"detected": [], "count": 0}
+
+        contact_ids = [c["id"] for c in contacts.data]
+        contact_map = {c["id"]: c for c in contacts.data}
+
+        # Get PENDING outreach attempts (no date filter — scan all pending)
+        attempts = (
+            sb.table("outreach_attempts")
+            .select("*")
+            .in_("contact_id", contact_ids)
+            .eq("feedback_status", FeedbackStatus.PENDING.value)
+            .execute()
+        )
+
+        if not attempts.data:
+            return {"detected": [], "count": 0}
+
+        # 2. Build lookup: full_name.lower() → [outreach attempt rows]
+        name_to_attempts: dict[str, list[dict]] = {}
+        for a in attempts.data:
+            c = contact_map.get(a["contact_id"], {})
+            name = c.get("full_name", "").lower().strip()
+            if name:
+                name_to_attempts.setdefault(name, []).append(a)
+
+        # 3. Get active Gmail connected account
+        connected_accounts = composio.connected_accounts.list(
+            user_ids=[req.user_id],
+            toolkit_slugs=["gmail"],
+        )
+
+        connected_account_id = None
+        for account in connected_accounts.items:
+            if account.status == "ACTIVE":
+                connected_account_id = account.id
+                break
+
+        if not connected_account_id:
+            raise HTTPException(status_code=400, detail="Gmail not connected. Connect via /composio/connect first.")
+
+        # 4. Fetch LinkedIn notification emails via Composio
+        result = composio.tools.execute(
+            "GMAIL_FETCH_EMAILS",
+            user_id=req.user_id,
+            connected_account_id=connected_account_id,
+            arguments={
+                "query": "from:linkedin.com newer_than:3d",
+                "max_results": 50,
+            },
+            dangerously_skip_version_check=True,
+        )
+
+        response_data = result.get("data", {}) if isinstance(result, dict) else {}
+        emails = response_data.get("emails", response_data.get("messages", []))
+        if isinstance(emails, dict):
+            emails = [emails]
+
+        # 5. Match emails to pending contacts
+        detected = []
+        matched_attempt_ids = set()
+
+        for email in emails:
+            subject = (email.get("subject") or "").lower()
+            body = (email.get("body") or email.get("snippet") or "").lower()
+            text = subject + " " + body
+
+            for name, attempt_list in name_to_attempts.items():
+                if name in text:
+                    for a in attempt_list:
+                        if a["id"] not in matched_attempt_ids:
+                            matched_attempt_ids.add(a["id"])
+                            c = contact_map.get(a["contact_id"], {})
+                            detected.append({
+                                "full_name": c.get("full_name", ""),
+                                "company_name": c.get("company_name", ""),
+                            })
+
+        # 6. Update matched outreach attempts → REPLIED + COMPLETED
+        for attempt_id in matched_attempt_ids:
+            sb.table("outreach_attempts").update({
+                "outcome": OutcomeType.REPLIED.value,
+                "feedback_status": FeedbackStatus.COMPLETED.value,
+            }).eq("id", attempt_id).execute()
+
+        return {"detected": detected, "count": len(detected)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"/feedback/auto-detect error: {e}")
+        return JSONResponse(status_code=500, content={"detail": str(e)})
 
 
 # ---------------------------------------------------------------------------
